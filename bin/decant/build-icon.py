@@ -13,6 +13,7 @@ blur and per-appearance fill specializations, and copies the layer assets into
 <output.icon>/Assets/.
 """
 import json, os, re, sys, shutil
+from xml.etree import ElementTree
 
 # CoreUI stores blend modes as CGBlendMode integers; .icon JSON uses names.
 BLEND = {0: "normal", 1: "multiply", 2: "screen", 3: "overlay", 4: "darken",
@@ -56,21 +57,26 @@ def colstr(c):
     return "%s:%.5f,%.5f,%.5f,1.00000" % (space, comp[0], comp[1], comp[2])
 
 
-def gradient_fill(cols):
+def gradient_fill(cols, entry=None):
     """A .icon linear-gradient must have exactly 2 colors. 1 color -> solid;
     >2 colors -> approximate with first+last (actool rejects other counts)."""
     cs = [colstr(c) for c in cols]
     if len(cs) == 1:
         return {"solid": cs[0]}
     if len(cs) == 2:
-        return {"linear-gradient": cs}
-    return {"linear-gradient": [cs[0], cs[-1]]}
+        f = {"linear-gradient": cs}
+    else:
+        f = {"linear-gradient": [cs[0], cs[-1]]}
+    o = _orientation(entry)
+    if o:
+        f["orientation"] = o
+    return f
 
 
 def fill(layer):
     g = layer.get("gradient")
     if g and g.get("colors"):
-        return gradient_fill(g["colors"])
+        return gradient_fill(g["colors"], g)
     c = layer.get("color")
     if c:
         return {"solid": colstr(c)}
@@ -105,7 +111,27 @@ def parse_size(s):
     return float(m.group(1)), float(m.group(2))
 
 
-def position_for(layer):
+def parse_svg_size(path):
+    """Return the intrinsic SVG canvas size from viewBox or width/height."""
+    try:
+        root = ElementTree.parse(path).getroot()
+    except Exception:
+        return None
+    view_box = root.get("viewBox")
+    if view_box:
+        nums = re.findall(r"-?\d+(?:\.\d+)?", view_box)
+        if len(nums) >= 4:
+            return float(nums[2]), float(nums[3])
+    width, height = root.get("width"), root.get("height")
+    if width and height:
+        nums_w = re.findall(r"\d+(?:\.\d+)?", width)
+        nums_h = re.findall(r"\d+(?:\.\d+)?", height)
+        if nums_w and nums_h:
+            return float(nums_w[0]), float(nums_h[0])
+    return None
+
+
+def position_for(layer, asset_path=None):
     """Convert a captured layer frame to a .icon position.
     CoreUI reports the rendered frame in canvas points. Icon Composer stores scale
     relative to the layer artwork's intrinsic size, not relative to the 1024 canvas.
@@ -115,6 +141,8 @@ def position_for(layer):
         return None
     x, y, w, h = f
     intrinsic = parse_size(layer.get("imageSize"))
+    if intrinsic is None and asset_path and asset_path.lower().endswith(".svg"):
+        intrinsic = parse_svg_size(asset_path)
     if intrinsic:
         iw, ih = intrinsic
         sx = w / iw if iw else 1.0
@@ -131,8 +159,20 @@ def position_for(layer):
             "translation-in-points": [round(cx, 3), round(cy, 3)]}
 
 
+def _point_xy(p):
+    if isinstance(p, (list, tuple)) and len(p) >= 2:
+        return float(p[0]), float(p[1])
+    if isinstance(p, str):
+        nums = re.findall(r"-?\d+(?:\.\d+)?", p)
+        if len(nums) >= 2:
+            return float(nums[0]), float(nums[1])
+    return None
+
+
 def _orientation(entry):
-    s = entry.get("start"); e = entry.get("end")
+    if not entry:
+        return None
+    s = _point_xy(entry.get("start")); e = _point_xy(entry.get("end"))
     if not (s and e):
         return None
     return {"start": {"x": round(s[0], 4), "y": round(s[1], 4)},
@@ -323,8 +363,8 @@ def main():
                 continue
             ext = saved.rsplit(".", 1)[1]
             clean = basename(l["name"]) + "." + ext
-            shutil.copy(os.path.join(extract_dir, saved),
-                        os.path.join(out, "Assets", clean))
+            src_path = os.path.join(extract_dir, saved)
+            shutil.copy(src_path, os.path.join(out, "Assets", clean))
             f0 = fill(l)
             if f0 and bottom_fill is None:
                 bottom_fill = f0  # first fill in stack order = bottom-most (backmost) layer
@@ -338,7 +378,7 @@ def main():
                 if fa and fa != f0 and tag is not None:
                     overrides.append({"appearance": tag, "value": fa})
             layer = {"image-name": clean, "name": basename(l["name"])}
-            pos = position_for(l)
+            pos = position_for(l, src_path)
             if pos:
                 layer["position"] = pos
             # Fill emission. A base fill of None means "no override — use the
