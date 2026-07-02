@@ -152,6 +152,8 @@ int main(int argc, char **argv) {
         NSString *carPath = argc > 1 ? @(argv[1]) : @"/System/Applications/App Store.app/Contents/Resources/Assets.car";
         NSString *iconName = argc > 2 ? @(argv[2]) : @"AppIcon";
         NSString *outDir = argc > 3 ? @(argv[3]) : [@"~/Desktop/AppStoreIcon-extract" stringByExpandingTildeInPath];
+        NSString *platformHint = argc > 4 ? @(argv[4]) : @"auto";
+        BOOL preferMac = [platformHint isEqualToString:@"macos"];
         [[NSFileManager defaultManager] createDirectoryAtPath:outDir withIntermediateDirectories:YES attributes:nil error:nil];
         NSError *err = nil;
         CUICatalog *cat = [[NSClassFromString(@"CUICatalog") alloc] initWithURL:[NSURL fileURLWithPath:carPath] error:&err];
@@ -167,10 +169,30 @@ int main(int argc, char **argv) {
             NSString *app = [appObj isKindOfClass:[NSNull class]] ? nil : appObj;
             NSString *key = app ?: @"Default";
             if (result[key]) continue;  // avoid dup if a name resolves to same as Default
-            id stack = [cat iconLayerStackWithName:iconName scaleFactor:1 deviceIdiom:0 deviceSubtype:0 displayGamut:0 appearanceName:app locale:nil];
+            id stack = nil;
+            long long usedIdiom = 0;
+            double usedScale = 1.0;
+            NSArray *idioms = preferMac ? @[@5, @6, @7, @0, @1, @2, @3, @4] : @[@0, @1, @2, @3, @4, @5, @6, @7];
+            NSArray *scales = preferMac ? @[@2.0, @1.0, @3.0] : @[@1.0, @2.0, @3.0];
+            for (NSNumber *idiomNum in idioms) {
+                for (NSNumber *scaleNum in scales) {
+                    long long idiom = idiomNum.longLongValue;
+                    double scale = scaleNum.doubleValue;
+                    stack = [cat iconLayerStackWithName:iconName scaleFactor:scale deviceIdiom:idiom deviceSubtype:0 displayGamut:0 appearanceName:app locale:nil];
+                    if (stack) {
+                        usedIdiom = idiom;
+                        usedScale = scale;
+                        break;
+                    }
+                }
+                if (stack) break;
+            }
             if (!stack) { result[key] = @"NOT FOUND"; continue; }
             NSMutableDictionary *sd = [NSMutableDictionary dictionary];
             sd[@"class"] = NSStringFromClass([stack class]);
+            sd[@"platformHint"] = platformHint;
+            sd[@"deviceIdiom"] = @(usedIdiom);
+            sd[@"scaleFactor"] = @(usedScale);
             id rp = val(stack, @"renderingProperties");
             if (rp) sd[@"renderingProperties"] = [rp description];
             if ([stack respondsToSelector:NSSelectorFromString(@"dataRepresentationWithError:")]) {

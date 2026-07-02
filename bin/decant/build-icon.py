@@ -95,16 +95,33 @@ def parse_frame(s):
     return tuple(float(n) for n in nums[:4])
 
 
-def position_for(frame_str):
-    """Convert a captured layer frame to a .icon position {scale, translation-in-points}.
-    Default frame {{0,0},{1024,1024}} -> identity (returns None).
-    scale = size/canvas; translation = layer-center offset from canvas center,
-    with y measured downward (icon canvas origin is top-left)."""
-    f = parse_frame(frame_str)
+def parse_size(s):
+    """'278x373' -> (278, 373) floats, or None."""
+    if not s:
+        return None
+    m = re.match(r"(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)$", str(s))
+    if not m:
+        return None
+    return float(m.group(1)), float(m.group(2))
+
+
+def position_for(layer):
+    """Convert a captured layer frame to a .icon position.
+    CoreUI reports the rendered frame in canvas points. Icon Composer stores scale
+    relative to the layer artwork's intrinsic size, not relative to the 1024 canvas.
+    """
+    f = parse_frame(layer.get("frame"))
     if not f:
         return None
     x, y, w, h = f
-    scale = round(((w / CANVAS) + (h / CANVAS)) / 2.0, 5)
+    intrinsic = parse_size(layer.get("imageSize"))
+    if intrinsic:
+        iw, ih = intrinsic
+        sx = w / iw if iw else 1.0
+        sy = h / ih if ih else 1.0
+        scale = round((sx + sy) / 2.0, 5)
+    else:
+        scale = round(((w / CANVAS) + (h / CANVAS)) / 2.0, 5)
     cx = (x + w / 2.0) - CANVAS / 2.0
     cy = (y + h / 2.0) - CANVAS / 2.0
     # near-identity -> omit
@@ -321,7 +338,7 @@ def main():
                 if fa and fa != f0 and tag is not None:
                     overrides.append({"appearance": tag, "value": fa})
             layer = {"image-name": clean, "name": basename(l["name"])}
-            pos = position_for(l.get("frame"))
+            pos = position_for(l)
             if pos:
                 layer["position"] = pos
             # Fill emission. A base fill of None means "no override — use the
