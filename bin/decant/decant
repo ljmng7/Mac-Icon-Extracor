@@ -96,22 +96,59 @@ resolve_app() {  # <root> <name> -> bundle path
   return 1
 }
 
-primary_stack() {  # <car> -> preferred IconImageStack name
+icon_stack_names() {  # <car> -> one IconImageStack name per line
   xcrun assetutil --info "$1" 2>/dev/null | python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit()
-n=[e.get("Name") for e in d[1:] if e.get("AssetType")=="IconImageStack"]
-for pref in ("AppIcon","AppIconUpdated"):
-    if pref in n: print(pref); sys.exit()
-print(n[0] if n else "")'
+seen=[]
+for e in d[1:]:
+    if e.get("AssetType") == "IconImageStack":
+        n=e.get("Name")
+        if n and n not in seen: seen.append(n)
+print("\n".join(seen))'
 }
 
-car_in() {  # <app-or-car> -> shallowest Assets.car
+icon_has_stack() {  # <car> <stack>
+  [[ -n "$2" ]] || return 1
+  local s
+  for s in "${(@f)$(icon_stack_names "$1")}"; do
+    [[ "$s" == "$2" ]] && return 0
+  done
+  return 1
+}
+
+primary_stack() {  # <car> -> preferred IconImageStack name
+  local s stacks
+  stacks=( "${(@f)$(icon_stack_names "$1")}" )
+  for s in AppIcon AppIconUpdated MacIcon macOS AppIcon-macOS AppIcon-iOS; do
+    if (( ${stacks[(Ie)$s]} )); then print -r -- "$s"; return 0; fi
+  done
+  [[ ${#stacks[@]} -gt 0 ]] && print -r -- "$stacks[1]"
+}
+
+bundle_icon_name() {  # <.app> -> Info.plist icon name/file when present
+  [[ -d "$1/Contents" && -f "$1/Contents/Info.plist" ]] || return 1
+  local n
+  n=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$1/Contents/Info.plist" 2>/dev/null || true)
+  [[ -n "$n" ]] || n=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$1/Contents/Info.plist" 2>/dev/null || true)
+  n="${n:t:r}"
+  [[ -n "$n" ]] && print -r -- "$n"
+}
+
+car_in() {  # <app-or-car> -> best Assets.car
   if [[ -d "$1" ]]; then
+    local c
+    for c in "$1/Contents/Resources/Assets.car" "$1/Assets.car"; do
+      [[ -f "$c" ]] && { print -r -- "$c"; return 0; }
+    done
     /usr/bin/find "$1" -name 'Assets.car' 2>/dev/null \
       | awk -F/ '{print NF"\t"$0}' | sort -n | head -1 | cut -f2-
   elif [[ "$1" == *.car ]]; then echo "$1"; fi
+}
+
+is_macos_catalog() {  # <target> <car>
+  [[ -d "$1/Contents" || "$2" == */Contents/Resources/Assets.car ]]
 }
 
 # Enumerate icon-bearing .app bundles under a root, deduped by app name.
@@ -142,6 +179,19 @@ Mount an IPSW first:  ipsw mount fs MyDevice_Restore.ipsw   (then pass the print
 # --- one-time setup: pick SDK/device, compile extractor, boot sim -------------
 EXTRACTOR_READY=0; MODE=""; DEV=""
 ensure_extractor() {
+  local requested="${1:-auto}"
+  [[ "$EXTRACTOR_READY" == 1 && "$MODE" == "$requested" ]] && return 0
+  if [[ "$requested" == host ]]; then
+    MODE=host
+    if [[ ! -x "$EXTRACT_BIN" || "$EXTRACT_SRC" -nt "$EXTRACT_BIN" ]]; then
+      print "Compiling host extractor…"
+      clang -fobjc-arc -framework Foundation -framework CoreGraphics \
+            -framework ImageIO -framework AppKit "$EXTRACT_SRC" -o "$EXTRACT_BIN" \
+        || die "failed to compile $EXTRACT_SRC"
+    fi
+    EXTRACTOR_READY=1
+    return 0
+  fi
   [[ "$EXTRACTOR_READY" == 1 ]] && return 0
   local sdk
   sdk=$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
@@ -169,23 +219,23 @@ ensure_extractor() {
   EXTRACTOR_READY=1
 }
 
-run_extractor() {  # <car> <stack> <workdir>
-  if [[ "$MODE" == sim ]]; then xcrun simctl spawn "$DEV" "$SIM_BIN" "$1" "$2" "$3"
-  else "$EXTRACT_BIN" "$1" "$2" "$3"; fi
+run_extractor() {  # <car> <stack> <workdir> [platform-hint]
+  if [[ "$MODE" == sim ]]; then xcrun simctl spawn "$DEV" "$SIM_BIN" "$1" "$2" "$3" "${4:-auto}"
+  else "$EXTRACT_BIN" "$1" "$2" "$3" "${4:-auto}"; fi
 }
 
 # --- build one .icon. Sets REASON on failure. Returns 0 on success ------------
 REASON=""
-build_one() {  # <car> <stack> <out.icon> <preview 0|1>
-  local car="$1" stack="$2" out="$3" preview="$4" stem="${3:t:r}"
+build_one() {  # <car> <stack> <out.icon> <preview 0|1> [extract-hint] [platform] [min-target]
+  local car="$1" stack="$2" out="$3" preview="$4" extract_hint="${5:-auto}" platform="${6:-iphoneos}" min_target="${7:-26.0}" stem="${3:t:r}"
   local work val; work=$(mktemp -d); val=$(mktemp -d)
   REASON=""
-  { run_extractor "$car" "$stack" "$work" >/dev/null 2>&1; } || { REASON="extraction failed"; rm -rf "$work" "$val"; return 1; }
+  { run_extractor "$car" "$stack" "$work" "$extract_hint" >/dev/null 2>&1; } || { REASON="extraction failed"; rm -rf "$work" "$val"; return 1; }
   python3 -c 'import json,sys;d=json.load(open(sys.argv[1]+"/extracted.json"));sys.exit(0 if any(isinstance(v,dict) and "groups" in v for v in d.values()) else 7)' "$work" \
     || { REASON="stack '$stack' not found"; rm -rf "$work" "$val"; return 1; }
   rm -rf "$out"
   python3 "$BUILDER" "$work" "$out" >/dev/null || { REASON="assembly failed"; rm -rf "$work" "$val"; return 1; }
-  if xcrun actool --compile "$val" "$out" --platform iphoneos --minimum-deployment-target 26.0 \
+  if xcrun actool --compile "$val" "$out" --platform "$platform" --minimum-deployment-target "$min_target" \
        --app-icon "$stem" --output-partial-info-plist "$val/p.plist" >/dev/null 2>"$val/err"; then
     if [[ "$preview" == 1 ]]; then
       local pv; pv=$(/usr/bin/find "$val" -name '*~ipad.png' -print -quit 2>/dev/null)
@@ -277,7 +327,11 @@ if [[ "$ALL" == 1 || ${#POS[@]} -eq 0 ]]; then
 fi
 
 # single icon
-INPUT="${POS[1]}"; ICON_NAME="${POS[2]:-AppIcon}"; OUTPUT="${POS[3]}"
+INPUT="${POS[1]}"; ICON_NAME="${POS[2]}"; OUTPUT="${POS[3]}"
+if [[ -z "$OUTPUT" && "$ICON_NAME" == *.icon ]]; then
+  OUTPUT="$ICON_NAME"
+  ICON_NAME=""
+fi
 if [[ -z "$ROOT_DIR" && -e "$INPUT" ]]; then
   TARGET="$INPUT"
 else
@@ -287,12 +341,23 @@ else
   print "Resolved '$INPUT' → ${TARGET#$ROOT/}"
 fi
 CAR=$(car_in "$TARGET"); [[ -n "$CAR" && -f "$CAR" ]] || die "no Assets.car found for $TARGET"
+if [[ -z "$ICON_NAME" && -d "$TARGET" ]]; then
+  candidate=$(bundle_icon_name "$TARGET" || true)
+  if icon_has_stack "$CAR" "$candidate"; then ICON_NAME="$candidate"; fi
+fi
 if [[ -z "$ICON_NAME" ]]; then ICON_NAME=$(primary_stack "$CAR"); fi
+[[ -n "$ICON_NAME" ]] || die "no IconImageStack found in $CAR"
 [[ -n "$OUTPUT" ]] || OUTPUT="$PWD/${INPUT:t:r}.icon"
 
-ensure_extractor
-print "Extracting '$ICON_NAME'…"
-if build_one "$CAR" "$ICON_NAME" "$OUTPUT" "$PREVIEW"; then rc=0; else rc=$?; fi
+EXTRACT_MODE=auto; EXTRACT_HINT=auto; ACTOOL_PLATFORM=iphoneos; ACTOOL_MIN=26.0
+if is_macos_catalog "$TARGET" "$CAR"; then
+  EXTRACT_MODE=host
+  EXTRACT_HINT=macos
+  ACTOOL_PLATFORM=macosx
+fi
+ensure_extractor "$EXTRACT_MODE"
+print "Extracting '$ICON_NAME' from $CAR…"
+if build_one "$CAR" "$ICON_NAME" "$OUTPUT" "$PREVIEW" "$EXTRACT_HINT" "$ACTOOL_PLATFORM" "$ACTOOL_MIN"; then rc=0; else rc=$?; fi
 case $rc in
   0) print "✓ Validated.  open \"$OUTPUT\"" ;;
   2) print "⚠ Exported but not validated by actool ($REASON) — it likely exceeds actool's limits (e.g. >4 groups, like iCloud), but the bundle is intact.  open \"$OUTPUT\"" ;;
